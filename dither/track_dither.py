@@ -1,58 +1,106 @@
 #!/usr/bin/env python3
 """
-Interactive star tracking + thumbnail cutouts + RA/Dec tracking.
-Features: 'sep' centering, platescale conversion, multi-star plots, and GIF creation.
+Unified Dither Tracking & In-Place Astrometric Calibration.
+Updates original FITS headers, skips 'dummy' WCS, and plots results.
 """
 
+import json
 import numpy as np
 from astropy.io import fits
+from astropy.wcs import WCS
+from astroquery.astrometry_net import AstrometryNet
 import sep
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
-from PIL import Image
+import time
 
-# Global Settings
-PLATE_SCALE = 0.1267  # arcsec/px
+# --- Settings ---
+PLATE_SCALE = 0.1267  # arcsec/px (Adjust for your instrument)
+ast = AstrometryNet()
 
-def get_sep_objects(image_data):
-    """Detects sources using 'sep' with winpos sub-pixel refinement."""
-    # Ensure native byte order for sep
-    data = image_data.byteswap().newbyteorder() if image_data.dtype.byteorder != '=' else image_data
+def load_config():
+    """Loads the API key from key.json."""
+    key_file = Path("key.json")
+    if not key_file.exists():
+        raise FileNotFoundError("Missing 'key.json'. Please create it with your 'astro_api_key'.")
+    with open(key_file, "r") as f:
+        config = json.load(f)
+    ast.api_key = config["astro_api_key"]
+
+def is_wcs_valid(header):
+    """Checks if the WCS is real celestial or just a 'pixel' placeholder."""
+    ctype1 = header.get('CTYPE1', '').upper().strip()
+    if not ctype1 or 'PIXEL' in ctype1:
+        return False
+    # Look for standard celestial projection identifiers
+    celestial_types = ['RA-', 'DEC-', 'GLON', 'GLAT', 'ELON', 'ELAT']
+    return any(c_type in ctype1 for c_type in celestial_types)
+
+def get_sources(data, limit=40, thresh=10.0):
+    """Detects stars for the astrometric solve using SEP."""
+    data = data.byteswap().newbyteorder() if data.dtype.byteorder != '=' else data
     data = data.astype(np.float32)
-
     try:
         bkg = sep.Background(data)
         data_sub = data - bkg.back()
-        bkg_rms = bkg.globalrms
+        objects = sep.extract(data_sub, thresh, err=bkg.globalrms)
+        if len(objects) > 0:
+            x, y, _ = sep.winpos(data_sub, objects['x'], objects['y'], 1.0)
+            idx = np.argsort(objects['flux'])[::-1]
+            return x[idx][:limit], y[idx][:limit]
     except:
-        data_sub = data - np.median(data)
-        bkg_rms = np.std(data)
-
-    objects = sep.extract(data_sub, 5.0, err=bkg_rms)
-    
-    if len(objects) > 0:
-        # winpos provides highly accurate centroids
-        x, y, flags = sep.winpos(data_sub, objects['x'], objects['y'], 1.0)
-        return x, y
+        pass
     return None, None
 
-def extract_telescope_coords(hdul):
-    """Parses 'HH:MM:SS.SS' and 'DD:MM:SS.SS' into decimal degrees."""
-    ra_keys = ['TELRA', 'RA', 'OBJCTRA']
-    dec_keys = ['TELDEC', 'DEC', 'OBJCTDEC']
-    
-    ra_raw, dec_raw = None, None
-    for hdu in hdul:
-        for k in ra_keys:
-            if k in hdu.header: ra_raw = hdu.header[k]; break
-        for k in dec_keys:
-            if k in hdu.header: dec_raw = hdu.header[k]; break
-        if ra_raw is not None and dec_raw is not None: break
+def solve_and_update(file_path):
+    """Solves the image and updates the header IN-PLACE."""
+    with fits.open(file_path) as hdul:
+        hdu = next((h for h in hdul if h.data is not None), None)
+        if hdu is None: return False
+        
+        if is_wcs_valid(hdu.header):
+            print(f"Skipping {file_path.name}: Valid celestial WCS already exists.")
+            return True
             
-    if ra_raw is None or dec_raw is None: return None, None
+        img = hdu.data.astype(float)
+        ny, nx = img.shape
 
-    def to_deg(val, is_ra=True):
+    x, y = get_sources(img)
+    if x is None or len(x) < 5:
+        print(f"Failed {file_path.name}: Not enough stars found.")
+        return False
+
+    print(f"Solving {file_path.name} (Astrometry.net)...")
+    try:
+        wcs_header = ast.solve_from_source_list(x, y, nx, ny, solve_timeout=60)
+    except Exception as e:
+        print(f"Solve Error on {file_path.name}: {e}")
+        return False
+
+    if wcs_header:
+        with fits.open(file_path, mode='update') as hdul:
+            target_hdu = next(h for h in hdul if h.data is not None)
+            # Purge all possible old/placeholder WCS keys
+            bad_keys = [
+                'WCSAXES', 'CTYPE1', 'CTYPE2', 'CRVAL1', 'CRVAL2', 
+                'CRPIX1', 'CRPIX2', 'CDELT1', 'CDELT2', 'CD1_1', 
+                'CD1_2', 'CD2_1', 'CD2_2', 'PC1_1', 'PC1_2', 'PC2_1', 'PC2_2'
+            ]
+            for k in bad_keys:
+                if k in target_hdu.header: del target_hdu.header[k]
+            
+            target_hdu.header.update(wcs_header)
+            target_hdu.header['HISTORY'] = 'Astrometric solution updated by Astrometry.net'
+            hdul.flush()
+        print(f"Success: {file_path.name} updated.")
+        return True
+    
+    return False
+
+def to_deg(val, is_ra=True):
+    if val is None: return None
+    try:
         if isinstance(val, str) and ':' in val:
             parts = val.strip().split(':')
             sign = -1.0 if '-' in parts[0] else 1.0
@@ -60,136 +108,99 @@ def extract_telescope_coords(hdul):
             deg = sign * (hms[0] + hms[1]/60.0 + hms[2]/3600.0)
             return deg * 15.0 if is_ra else deg
         return float(val) * 15.0 if (is_ra and float(val) < 24) else float(val)
+    except: return None
 
-    return to_deg(ra_raw, True), to_deg(dec_raw, False)
-
-def save_cutouts(image_data, positions, frame_name, output_dir, box_size=15):
-    """Saves sub-pixel accurate thumbnails."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True)
-    
-    for i, pos in enumerate(positions):
-        if pos is None: continue
-        x_img, y_img = pos
-        ix, iy = int(round(x_img)), int(round(y_img))
-        
-        y_min, y_max = iy - box_size, iy + box_size + 1
-        x_min, x_max = ix - box_size, ix + box_size + 1
-        
-        if y_min < 0 or x_min < 0 or y_max > image_data.shape[0] or x_max > image_data.shape[1]:
-            continue
-            
-        cutout = image_data[y_min:y_max, x_min:x_max]
-        mx, my = x_img - x_min, y_img - y_min
-        
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.imshow(cutout, cmap='gray', origin='lower', 
-                  vmin=np.percentile(cutout, 5), vmax=np.percentile(cutout, 99))
-        ax.plot(mx, my, 'rx', markersize=10)
-        ax.set_title(f"Star {i+1} | {frame_name}")
-        ax.axis('off')
-        plt.savefig(output_dir / f"{frame_name}_star{i+1}.png", dpi=80, bbox_inches='tight')
-        plt.close(fig)
-
-def create_tracking_gifs(output_dir, num_stars, frame_stems):
-    """Combines PNG cutouts into GIFs."""
-    output_dir = Path(output_dir)
-    for i in range(num_stars):
-        star_id = i + 1
-        frames = []
-        for stem in frame_stems:
-            img_path = output_dir / f"{stem}_star{star_id}.png"
-            if img_path.exists():
-                frames.append(Image.open(img_path))
-        
-        if frames:
-            gif_path = output_dir.parent / f"star_{star_id}_tracking.gif"
-            frames[0].save(gif_path, save_all=True, append_images=frames[1:], 
-                           duration=200, loop=0)
-            print(f"GIF created: {gif_path}")
-
-def process(folder, search_radius=25):
+def run_analysis(folder):
     folder = Path(folder)
-    files = sorted(folder.glob('*.fits')) + sorted(folder.glob('*.fit'))
-    if not files: return
-
-    with fits.open(files[0]) as hdul:
-        img_hdu = next((h for h in hdul if h.data is not None), None)
-        ref_img = img_hdu.data.astype(float)
-        ra0, dec0 = extract_telescope_coords(hdul)
-
-    sx_list, sy_list = get_sep_objects(ref_img)
-    if sx_list is None: return
-
-    # Interactive Snapping
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(ref_img, cmap='gray', origin='lower', vmin=np.percentile(ref_img, 1), vmax=np.percentile(ref_img, 99))
-    ax.set_title("Select stars, then press ENTER.")
+    files = sorted(list(folder.glob('*.fit*')))
     
-    selected_coords = []
+    # 1. Solve phase
+    for f in files:
+        solve_and_update(f)
+        time.sleep(0.5)
+
+    # 2. Collection phase
+    valid_files, wcs_centers, tel_coords, pixel_positions = [], [], [], []
+
+    ref_img, ref_header = None, None
+    for f in files:
+        with fits.open(f) as hdul:
+            hdu = next((h for h in hdul if h.data is not None), None)
+            if hdu and is_wcs_valid(hdu.header):
+                ref_img = hdu.data.astype(float)
+                ref_header = hdu.header
+                break
+    
+    if ref_img is None:
+        print("\nNo solved files found. Cannot perform tracking analysis.")
+        return
+
+    sx, sy = get_sources(ref_img, limit=200, thresh=5.0)
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.imshow(ref_img, cmap='gray', origin='lower', vmin=np.percentile(ref_img, 5), vmax=np.percentile(ref_img, 95))
+    ax.set_title("Select Stars for Tracking, then press ENTER")
+    
+    selected = []
     def onclick(event):
         if event.inaxes != ax: return
-        idx = np.argmin(np.sqrt((sx_list - event.xdata)**2 + (sy_list - event.ydata)**2))
-        selected_coords.append((sx_list[idx], sy_list[idx]))
-        ax.plot(sx_list[idx], sy_list[idx], 'ro', mfc='none', markersize=10)
-        ax.text(sx_list[idx], sy_list[idx] + 5, f"{len(selected_coords)}", color='red', fontweight='bold')
+        idx = np.argmin(np.sqrt((sx - event.xdata)**2 + (sy - event.ydata)**2))
+        selected.append((sx[idx], sy[idx]))
+        ax.plot(sx[idx], sy[idx], 'ro', mfc='none', markersize=10)
         fig.canvas.draw()
-
     fig.canvas.mpl_connect('button_press_event', onclick)
     fig.canvas.mpl_connect('key_press_event', lambda e: plt.close(fig) if e.key=='enter' else None)
     plt.show()
 
-    if not selected_coords: return
+    if not selected: return
 
-    all_positions = [selected_coords]
-    ra_list, dec_list = [ra0], [dec0]
-    frame_stems = [files[0].stem]
-    save_cutouts(ref_img, selected_coords, files[0].stem, folder / "cutouts")
-
-    for f in files[1:]:
+    last_p = selected
+    for f in files:
         with fits.open(f) as hdul:
-            img_hdu = next((h for h in hdul if h.data is not None), None)
-            if img_hdu is None: continue
-            img = img_hdu.data.astype(float)
-            ra, dec = extract_telescope_coords(hdul)
-            cx, cy = get_sep_objects(img)
-            
-            if cx is not None:
-                current_stars = []
-                for rx, ry in all_positions[-1]:
-                    d = np.sqrt((cx - rx)**2 + (cy - ry)**2)
-                    idx = np.argmin(d)
-                    current_stars.append((cx[idx], cy[idx]) if d[idx] < search_radius else None)
+            hdu = next((h for h in hdul if h.data is not None), None)
+            if hdu and is_wcs_valid(hdu.header):
+                w = WCS(hdu.header)
+                ny, nx = hdu.data.shape
+                wra, wdec = w.all_pix2world(nx/2, ny/2, 0)
+                tra = to_deg(hdu.header.get('TELRA', hdu.header.get('RA')), True)
+                tdec = to_deg(hdu.header.get('TELDEC', hdu.header.get('DEC')), False)
                 
-                if all(p is not None for p in current_stars):
-                    all_positions.append(current_stars)
-                    ra_list.append(ra); dec_list.append(dec)
-                    frame_stems.append(f.stem)
-                    save_cutouts(img, current_stars, f.stem, folder / "cutouts")
+                cx, cy = get_sources(hdu.data.astype(float), limit=200, thresh=5.0)
+                current_frame_p = []
+                for rx, ry in last_p:
+                    d = np.sqrt((cx-rx)**2 + (cy-ry)**2)
+                    idx = np.argmin(d)
+                    current_frame_p.append((cx[idx], cy[idx]) if d[idx] < 20 else None)
+                
+                if all(p is not None for p in current_frame_p):
+                    valid_files.append(f.name)
+                    wcs_centers.append((wra, wdec))
+                    tel_coords.append((tra, tdec))
+                    pixel_positions.append(current_frame_p)
+                    last_p = current_frame_p
 
-    # Plotting and GIFs
-    if len(all_positions) > 1 and ra0 is not None:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        dra_req = np.array([(r - ra0) * 3600.0 * np.cos(np.radians(dec0)) for r in ra_list])
-        ddec_req = np.array([(d - dec0) * 3600.0 for d in dec_list])
+    # 3. Plotting
+    if len(valid_files) > 1:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        w0_ra, w0_dec = wcs_centers[0]
+        colors = plt.cm.tab10(np.linspace(0, 1, len(selected)))
         
-        colors = plt.cm.viridis(np.linspace(0, 1, len(selected_coords)))
-        for i in range(len(selected_coords)):
-            dx_arc = np.array([p[i][0] - all_positions[0][i][0] for p in all_positions]) * PLATE_SCALE
-            dy_arc = np.array([p[i][1] - all_positions[0][i][1] for p in all_positions]) * PLATE_SCALE
-            ax1.plot(dx_arc, dra_req, 'o-', color=colors[i], label=f"Star {i+1}")
-            ax2.plot(dy_arc, ddec_req, 'o-', color=colors[i], label=f"Star {i+1}")
+        for i in range(len(selected)):
+            dx = np.array([p[i][0] - pixel_positions[0][i][0] for p in pixel_positions]) * PLATE_SCALE
+            dy = np.array([p[i][1] - pixel_positions[0][i][1] for p in pixel_positions]) * PLATE_SCALE
+            dwra = np.array([(c[0]-w0_ra)*3600*np.cos(np.radians(w0_dec)) for c in wcs_centers])
+            dwdec = np.array([(c[1]-w0_dec)*3600 for c in wcs_centers])
+            
+            ax1.plot(dx, dwra, 'o-', color=colors[i], label=f"Star {i+1}")
+            ax2.plot(dy, dwdec, 'o-', color=colors[i])
 
-        ax1.set_xlabel("Measured Position (arcseconds)"); ax1.set_ylabel("Requested Position (arcseconds)")
-        ax2.set_xlabel("Measured Position (arcseconds)"); ax2.set_ylabel("Requested Position (arcseconds)")
-        ax1.legend(); ax2.legend(); plt.tight_layout()
-        plt.savefig(folder / "dither_analysis.png", dpi=150)
+        ax1.set_title("RA Verification (WCS)"); ax1.set_xlabel("Measured dX (arcsec)"); ax1.set_ylabel("WCS dRA (arcsec)")
+        ax2.set_title("Dec Verification (WCS)"); ax2.set_xlabel("Measured dY (arcsec)"); ax2.set_ylabel("WCS dDec (arcsec)")
+        ax1.legend(); ax1.grid(True); ax2.grid(True)
+        plt.tight_layout()
         plt.show()
 
-        create_tracking_gifs(folder / "cutouts", len(selected_coords), frame_stems)
-
 if __name__ == "__main__":
+    load_config()
     parser = argparse.ArgumentParser()
     parser.add_argument("folder")
-    args = parser.parse_args()
-    process(args.folder)
+    run_analysis(parser.parse_args().folder)
