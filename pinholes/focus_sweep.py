@@ -353,12 +353,26 @@ def plot_focus_curve(results, out_png, fit_parabola=False, focus_kw="FOCUS"):
     frame_med = frame_med[order]
     good = [good[i] for i in order]
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    for r in good:
-        pts = r["per_trace_median"]
-        ax.scatter([r["focus"]] * len(pts), pts, color="grey", s=16, alpha=0.5)
-    ax.plot(focus, frame_med, "o-", color="C0", ms=8, lw=1.5,
-            label="Frame median")
+    # (n_frames, n_traces) matrix of per-trace medians
+    per_trace = np.array([r["per_trace_median"] for r in good])
+    n_traces = per_trace.shape[1]
+    colors = plt.cm.tab10(np.arange(n_traces) % 10)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # One coloured line per trace, skipping NaN samples
+    for i in range(n_traces):
+        vals = per_trace[:, i]
+        mask = np.isfinite(vals)
+        if not np.any(mask):
+            continue
+        style = "o-" if np.sum(mask) >= 2 else "o"
+        ax.plot(focus[mask], vals[mask], style, color=colors[i],
+                ms=5, lw=1.0, alpha=0.8, label=f"Trace {i + 1}")
+
+    # Frame median on top
+    ax.plot(focus, frame_med, "o-", color="black", ms=9, lw=2.2,
+            label="Frame median", zorder=10)
 
     if fit_parabola and len(focus) >= 3:
         c = np.polyfit(focus, frame_med, 2)
@@ -367,18 +381,19 @@ def plot_focus_curve(results, out_png, fit_parabola=False, focus_kw="FOCUS"):
             yy = np.polyval(c, xx)
             best = -c[1] / (2 * c[0])
             best_fwhm = np.polyval(c, best)
-            ax.plot(xx, yy, "--", color="red", lw=1.2,
+            ax.plot(xx, yy, "--", color="red", lw=1.5,
                     label=f"Parabola: best {focus_kw}={best:.4g}, "
-                          f"FWHM={best_fwhm:.3f} pix")
+                          f"FWHM={best_fwhm:.3f} pix",
+                    zorder=11)
             ax.axvline(best, color="red", lw=0.6, ls=":", alpha=0.6)
         else:
             print("Parabola has negative curvature; skipping overlay.")
 
-    ax.scatter([], [], color="grey", s=16, alpha=0.7,
-               label="Per-trace medians")
-    ax.set_xlabel(focus_kw); ax.set_ylabel("Median FWHM [pix]")
+    ax.set_xlabel(focus_kw)
+    ax.set_ylabel("Median FWHM [pix]")
     ax.set_title(f"Focus sweep ({len(good)} frames)")
-    ax.grid(alpha=0.3); ax.legend()
+    ax.grid(alpha=0.3)
+    ax.legend(loc="best", fontsize=9, ncol=2)
     fig.tight_layout()
     fig.savefig(out_png, dpi=150)
     plt.close(fig)
