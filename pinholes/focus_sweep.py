@@ -483,18 +483,31 @@ def main():
         r.pop("data", None)         # drop large arrays before keeping
         results.append(r)
 
-    out_npz = args.folder / "focus_sweep.npz"
-    np.savez(
-        out_npz,
-        filenames=np.array([str(r["path"]) for r in results]),
-        focus=np.array([r["focus"] if r["focus"] is not None else np.nan
-                        for r in results]),
-        per_trace_median=np.array([r["per_trace_median"] for r in results],
-                                  dtype=object),
-        frame_median=np.array([r["frame_median"] for r in results]),
-        x_positions=np.array([r["x_positions"] for r in results], dtype=object),
-    )
-    print(f"\nSaved results -> {out_npz}")
+    # Sort by focus (matches the plot), and write one row per frame
+    def _focus_key(r):
+        return r["focus"] if r["focus"] is not None else float("inf")
+    results_sorted = sorted(results, key=_focus_key)
+    n_traces_max = max((len(r["per_trace_median"]) for r in results_sorted),
+                       default=0)
+
+    out_csv = args.folder / "focus_sweep.csv"
+    with open(out_csv, "w", newline="") as fh:
+        import csv
+        w = csv.writer(fh)
+        w.writerow(
+            ["filename", args.focus_kw, "frame_median_fwhm"]
+            + [f"trace_{i + 1}_fwhm" for i in range(n_traces_max)]
+        )
+        for r in results_sorted:
+            focus = "" if r["focus"] is None else f"{r['focus']:.6g}"
+            frame = ("" if not np.isfinite(r["frame_median"])
+                     else f"{r['frame_median']:.6g}")
+            per = [("" if not np.isfinite(v) else f"{v:.6g}")
+                   for v in r["per_trace_median"]]
+            # Pad in case a frame has fewer traces than the max
+            per += [""] * (n_traces_max - len(per))
+            w.writerow([r["path"].name, focus, frame] + per)
+    print(f"\nSaved results -> {out_csv}")
 
     plot_focus_curve(results, args.folder / "focus_sweep.png",
                      fit_parabola=args.fit_parabola, focus_kw=args.focus_kw)
