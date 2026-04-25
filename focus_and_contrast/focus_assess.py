@@ -24,9 +24,11 @@ Strategy
      * fit upper envelope through peak values with a smoothing spline,
        lower envelope through gap values with a low-order polynomial
      * normalise: (profile - lower_env) / (upper_env - lower_env)
-     * Michelson contrast (P - T) / (P + T) at each peak / adjacent-trough
+     * "contrast" defined as 1 - Michelson = 1 - (P - T) / (P + T)
+       = 2T / (P + T) at each peak / adjacent-trough.
+       Range 0 (sharp, troughs at floor) to ~1 (blurry, troughs filled in).
 3. Score = median of all contrast values across all peaks and all columns
-   (more samples than median-of-medians, less noisy).  Higher = sharper.
+   (more samples than median-of-medians, less noisy).  LOWER = SHARPER.
 4. Outputs (in <folder>/focus_results/):
      * focus_scores.csv  -- rank, filename, contrast, scatter, FOCUS hdr
      * profile_<n>.png   -- multi-panel diagnostic, N_plot rows x 2 cols
@@ -302,9 +304,10 @@ def measure_focus(data, trace_coeffs, eval_cols,
         P_pair = np.minimum(P[:-1], P[1:])
         denom = P_pair + T
         with np.errstate(divide="ignore", invalid="ignore"):
+            # contrast = 1 - Michelson = 2T/(P+T); 0 = sharp, ~1 = blurry
             mich = np.where(
                 np.isfinite(P_pair) & np.isfinite(T) & (denom > 0),
-                (P_pair - T) / denom,
+                1.0 - (P_pair - T) / denom,
                 np.nan,
             )
         mich = np.where(trough_mask, mich, np.nan)
@@ -474,15 +477,15 @@ def topographic_plot(name, diag_list, ny, nx, score, out_path,
                   method="linear")
 
     fig, ax = plt.subplots(figsize=(10, 6.5))
-    # Display with extent matching the original frame so the user
-    # gets a feel for spatial coverage
     extent = (xi.min(), xi.max(), yi.min(), yi.max())
-    vmin = np.nanpercentile(cs, 2)
-    vmax = np.nanpercentile(cs, 98)
+    # Fixed scale [0, 1] so all topo plots are directly comparable.
+    # 0 = troughs at floor (sharp); ~1 = troughs fill to peak (totally blurred).
+    vmin, vmax = 0.0, 1.0
+    # 'magma': dark = low contrast = sharp; bright = high = blurry.
+    # Reads like a 'defocus thermometer'.
     im = ax.imshow(GZ, origin="lower", aspect="auto", extent=extent,
-                   cmap="viridis", vmin=vmin, vmax=vmax)
-    # Overlay the actual measurement points lightly
-    ax.scatter(xs, ys, c=cs, s=4, cmap="viridis", vmin=vmin, vmax=vmax,
+                   cmap="magma", vmin=vmin, vmax=vmax)
+    ax.scatter(xs, ys, c=cs, s=4, cmap="magma", vmin=vmin, vmax=vmax,
                edgecolors="k", linewidths=0.15, alpha=0.7)
     ax.set_xlim(0, nx)
     ax.set_ylim(0, ny)
@@ -493,7 +496,7 @@ def topographic_plot(name, diag_list, ny, nx, score, out_path,
         title += f"   |   {focus_key} = {focus_val:g}"
     ax.set_title(title, fontsize=10)
     cbar = fig.colorbar(im, ax=ax, shrink=0.85)
-    cbar.set_label("Michelson contrast")
+    cbar.set_label("Contrast (1 - Michelson) -- lower = sharper")
     plt.tight_layout()
     plt.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -516,11 +519,11 @@ def summary_focus_plot(rows, focus_key, out_path):
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.errorbar(focus, scores, yerr=scatters, fmt="o-", lw=1, capsize=3,
                 color="C0", markersize=5)
-    best_i = int(np.argmax(scores))
+    best_i = int(np.argmin(scores))
     ax.scatter([focus[best_i]], [scores[best_i]], s=140, facecolor="none",
-               edgecolor="red", lw=1.5, zorder=5, label="best")
+               edgecolor="red", lw=1.5, zorder=5, label="best (sharpest)")
     ax.set_xlabel(f"{focus_key} (header)")
-    ax.set_ylabel("Michelson contrast (median, all peaks)")
+    ax.set_ylabel("Contrast = 1 - Michelson  (lower = sharper)")
     ax.set_title(f"Focus sweep: contrast vs {focus_key}")
     ax.grid(alpha=0.3)
     ax.legend(loc="best", fontsize=9)
@@ -651,7 +654,8 @@ def main():
                 focus_val=focus_val, focus_key=args.focus_key,
             )
 
-    rows.sort(key=lambda t: np.nan_to_num(t[1], nan=-np.inf), reverse=True)
+    # Best (sharpest) has the LOWEST contrast now -- sort ascending.
+    rows.sort(key=lambda t: np.nan_to_num(t[1], nan=np.inf))
     print("\nRanking (best -> worst):")
     for i, (name, s, sc, fv) in enumerate(rows, 1):
         fv_str = f"{fv:.3f}" if fv is not None else "  --  "
