@@ -180,7 +180,7 @@ def robust_polyfit(x, y, deg=3, sigma=3.0, n_iter=3):
 # Extraction
 # ---------------------------------------------------------------------------
 
-def extract_flux(data, coeffs, fwhm_val, k=0.6,
+def extract_flux(data, coeffs, fwhm_val, k=0.3,
                  bg_subtract=False, bg_gap=2.0, bg_width=3.0):
     """Top-hat sum within ±k*FWHM of the trace.
 
