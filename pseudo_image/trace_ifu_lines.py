@@ -2,122 +2,117 @@ import sys
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from astropy.io import fits
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 
 def get_centroid(profile, peak_index, window=3):
-    """Calculates the center of mass around a peak for sub-pixel accuracy."""
+    """Calculates sub-pixel peak position using center of mass."""
     y = np.arange(peak_index - window, peak_index + window + 1)
     y = y[(y >= 0) & (y < len(profile))]
     weights = profile[y]
+    # Background subtraction to sharpen the centroid
+    weights = np.maximum(weights - np.nanmin(weights), 0)
     if np.sum(weights) == 0:
         return peak_index
     return np.sum(y * weights) / np.sum(weights)
 
-def analyze_ifu_traces(fits_path, extension=None, n_steps=15, poly_order=3):
+def analyze_ifu_traces(fits_path, extension=1, n_steps=30, poly_order=3, expected_traces=244):
     try:
         with fits.open(fits_path) as hdul:
-            data = None
-            if extension is not None:
-                data = hdul[extension].data
-            else:
-                for i, hdu in enumerate(hdul):
-                    if hdu.data is not None and isinstance(hdu.data, np.ndarray):
-                        if hdu.data.ndim == 2:
-                            data = hdu.data
-                            extension = i
-                            break
-            if data is None:
-                print("Error: No 2D image data found.")
+            if extension >= len(hdul):
+                print(f"Error: Extension {extension} not found.")
                 return
+            data = hdul[extension].data.astype(float)
+            print(f"Loaded data from extension {extension} (Shape: {data.shape})")
     except Exception as e:
         print(f"Error: {e}")
         return
 
     ny, nx = data.shape
     
-    # 1. Get reference peaks from the center
+    # 1. Establish reference peaks at the center
     center_x = nx // 2
-    profile_mid = np.median(data[:, center_x-2 : center_x+3], axis=1)
-    profile_mid_sm = gaussian_filter1d(profile_mid, sigma=1.0)
+    profile_mid = np.median(data[:, center_x-10 : center_x+10], axis=1)
+    profile_mid_sm = gaussian_filter1d(profile_mid, sigma=1.2)
     
     ref_peaks, _ = find_peaks(
         profile_mid_sm, 
-        distance=10, 
-        width=1.5, 
-        prominence=np.nanpercentile(profile_mid_sm, 90) * 0.05
+        distance=4, 
+        prominence=np.nanpercentile(profile_mid_sm, 5) # Lowered for faint traces
     )
     
-    n_traces = len(ref_peaks)
-    print(f"Detected {n_traces} reference traces.")
+    ref_peaks = np.sort(ref_peaks)
+    n_detected = len(ref_peaks)
+    print(f"Detected {n_detected} reference traces at X={center_x}.")
 
-    # 2. Sample at specified X-locations
-    x_locs = np.linspace(20, nx - 20, n_steps, dtype=int)
-    trace_coords = {i: {"x": [], "y": []} for i in range(n_traces)}
-
-    print(f"Tracing across {n_steps} X-locations...")
-    for x in x_locs:
-        col_prof = np.median(data[:, max(0, x-2) : min(nx, x+3)], axis=1)
-        col_prof_sm = gaussian_filter1d(col_prof, sigma=1.0)
+    # 2. Sequential Tracing
+    trace_data = {i: {"x": [], "y": []} for i in range(n_detected)}
+    x_locs = np.linspace(50, nx - 50, n_steps, dtype=int)
+    
+    for direction in [1, -1]: 
+        current_positions = np.copy(ref_peaks).astype(float)
+        relevant_x = x_locs[x_locs > center_x] if direction == 1 else x_locs[x_locs < center_x][::-1]
         
-        peaks, _ = find_peaks(
-            col_prof_sm, 
-            distance=10, 
-            width=1.5, 
-            prominence=np.nanpercentile(col_prof_sm, 90) * 0.05
-        )
-        
-        for i, ref_y in enumerate(ref_peaks):
-            if len(peaks) > 0:
-                diffs = np.abs(peaks - ref_y)
+        for x in relevant_x:
+            col_prof = np.median(data[:, x-2 : x+3], axis=1)
+            col_prof_sm = gaussian_filter1d(col_prof, sigma=1.0)
+            peaks, _ = find_peaks(col_prof_sm, distance=4, prominence=np.nanpercentile(col_prof_sm, 5))
+            
+            if len(peaks) == 0: continue
+                
+            for i in range(n_detected):
+                diffs = np.abs(peaks - current_positions[i])
                 closest_idx = np.argmin(diffs)
                 
-                # Match within 15 pixels to accommodate larger smile at edges
-                if diffs[closest_idx] < 15:
+                if diffs[closest_idx] < 8:
                     sub_y = get_centroid(col_prof, peaks[closest_idx], window=2)
-                    trace_coords[i]["x"].append(x)
-                    trace_coords[i]["y"].append(sub_y)
+                    trace_data[i]["x"].append(x)
+                    trace_data[i]["y"].append(sub_y)
+                    current_positions[i] = sub_y
 
-    # 3. Fit and Visualize with Points
-    plt.figure(figsize=(14, 10))
-    plt.imshow(data, origin='lower', cmap='gray', aspect='auto', 
-               vmin=np.percentile(data, 5), vmax=np.percentile(data, 95))
+    # 3. Fitting and Adjusted Visualization
+    # Reduced plot size by 30% (original was roughly 12x7, now ~8.4x4.9)
+    fig, ax = plt.subplots(figsize=(8.4, 4.9))
     
-    plot_x = np.linspace(0, nx, nx)
+    # Apply Log Scale for the image display
+    # We clip the data to avoid non-positive values for LogNorm
+    vmin = np.nanpercentile(data[data > 0], 5)
+    vmax = np.nanpercentile(data, 99)
+    im = ax.imshow(data, origin='lower', cmap='magma', aspect='auto', 
+                   norm=LogNorm(vmin=vmin, vmax=vmax))
+    
     all_coeffs = []
+    plot_x = np.arange(nx)
 
-    for i in range(n_traces):
-        xs = np.array(trace_coords[i]["x"])
-        ys = np.array(trace_coords[i]["y"])
+    for i in range(n_detected):
+        xs = np.array(trace_data[i]["x"])
+        ys = np.array(trace_data[i]["y"])
         
-        if len(xs) > 3: # Need at least 4 points for a cubic fit
-            # Plot the raw detected points (Cyan dots)
-            plt.scatter(xs, ys, color='cyan', s=5, alpha=0.8, zorder=3)
+        if len(xs) > poly_order + 2:
+            # Reintroduce raw data points (Cyan)
+            ax.scatter(xs, ys, color='cyan', s=1.5, alpha=0.4, zorder=3)
             
-            # Fit and plot the polynomial (Red line)
             coeffs = np.polyfit(xs, ys, poly_order)
             all_coeffs.append(coeffs)
             
-            fit_y = np.polyval(coeffs, plot_x)
-            plt.plot(plot_x, fit_y, color='red', lw=0.6, alpha=0.6, zorder=4)
+            # Plot the Polynomial fit (Red)
+            ax.plot(plot_x, np.polyval(coeffs, plot_x), color='red', lw=0.5, alpha=0.6, zorder=4)
 
-    plt.title(f"IFU Tracing: Polynomial fits (red) and detected points (cyan)\n{n_steps} steps, Order {poly_order}")
-    plt.xlabel("X (Pixels)")
-    plt.ylabel("Y (Pixels)")
-    plt.xlim(0, nx)
-    plt.ylim(0, ny)
+    ax.set_title(f"IFU Tracing: {len(all_coeffs)} Fits | Log Scale")
+    ax.set_xlabel("Dispersion (Pixels)")
+    ax.set_ylabel("Spatial (Pixels)")
     plt.tight_layout()
     plt.show()
-    
+
     return all_coeffs
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IFU Trace Fitting with Point Visualization.")
-    parser.add_argument("file", help="Path to the FITS file")
-    parser.add_argument("--ext", type=int, default=None, help="FITS extension index")
-    parser.add_argument("--steps", type=int, default=15, help="Number of points along X")
-    parser.add_argument("--order", type=int, default=3, help="Polynomial order")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("file")
+    parser.add_argument("--ext", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=30)
+    parser.add_argument("--order", type=int, default=3)
     args = parser.parse_args()
     analyze_ifu_traces(args.file, args.ext, n_steps=args.steps, poly_order=args.order)
