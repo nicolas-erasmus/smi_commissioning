@@ -40,6 +40,7 @@ Usage
         --csv final_data.csv --aperture-scale 1.0
 """
 import argparse
+import glob
 import os
 import sys
 
@@ -48,6 +49,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from astropy.io import fits
 from matplotlib.colors import LogNorm
+from matplotlib.patches import Ellipse
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
@@ -56,6 +58,12 @@ try:
     import sep
 except ImportError:
     sys.exit("Could not import `sep`. Install with `pip install sep`.")
+
+try:
+    from PIL import Image as PILImage
+    HAVE_PIL = True
+except ImportError:
+    HAVE_PIL = False
 
 
 N_FIBERS_EXPECTED = 244
@@ -398,25 +406,54 @@ def plot_yprofile(yprof, sources, out_path):
     plt.close(fig)
 
 
-def plot_image1_detection(data, sources, radii, out_path):
-    """Image 1 with sep apertures overlaid."""
-    fig, ax = plt.subplots(figsize=(8, 16))
-    pos = data[data > 0]
-    if pos.size:
-        vmin, vmax = np.nanpercentile(pos, [5, 99.5])
-    else:
-        vmin, vmax = 1, 100
-    ax.imshow(data, origin="lower", cmap="magma", aspect="auto",
-              norm=LogNorm(vmin=max(vmin, 1e-3), vmax=vmax))
+def plot_image1_detection(data, sources, radii, out_path,
+                          x_band=50, vmin=None, vmax=None):
+    """Image 1 with sep apertures overlaid.
+
+    EQUAL aspect so apertures render as round circles, not ellipses.
+    LINEAR stretch with min/max (or 1-99.5 percentiles by default to
+    keep hot pixels from washing out the dots) -- this matches the
+    "scale image min/max and you can see them" behaviour.
+    The X axis is cropped to a band around the dot column so the
+    apertures are visible at a sensible scale on the page.
+    """
+    ny, nx = data.shape
+    x_center = int(np.median(sources["x"]))
+    xa = max(0, x_center - x_band)
+    xb = min(nx, x_center + x_band + 1)
+    crop = data[:, xa:xb]
+
+    if vmin is None:
+        vmin = float(np.nanpercentile(crop, 1.0))
+    if vmax is None:
+        vmax = float(np.nanpercentile(crop, 99.5))
+
+    crop_w = xb - xa
+    fig_h = 16.0
+    fig_w = max(2.5, min(8.0, fig_h * crop_w / ny))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    ax.imshow(
+        crop, origin="lower", cmap="magma", aspect="equal",
+        vmin=vmin, vmax=vmax,
+        extent=[xa - 0.5, xb - 0.5, -0.5, ny - 0.5],
+        interpolation="nearest",
+    )
     for (_, row), r in zip(sources.iterrows(), radii):
         circ = plt.Circle((row["x"], row["y"]), r, color="cyan",
-                          fill=False, lw=0.4)
+                          fill=False, lw=0.5)
         ax.add_patch(circ)
+
+    ax.set_xlim(xa - 0.5, xb - 0.5)
+    ax.set_ylim(-0.5, ny - 0.5)
+    ax.set_xlabel("X (pixel)")
+    ax.set_ylabel("Y (pixel)")
     ax.set_title(
         f"Image 1 detections — N={len(sources)},  "
         f"<FWHM>={sources['fwhm'].median():.2f} px,  "
-        f"FWHM range [{sources['fwhm'].min():.2f}, {sources['fwhm'].max():.2f}]",
-        fontsize=11,
+        f"FWHM range [{sources['fwhm'].min():.2f}, {sources['fwhm'].max():.2f}],  "
+        f"X drift={sources['x'].max() - sources['x'].min():.2f} px",
+        fontsize=10,
     )
     fig.savefig(out_path, bbox_inches="tight", dpi=150)
     plt.close(fig)
@@ -424,20 +461,28 @@ def plot_image1_detection(data, sources, radii, out_path):
 
 def plot_throughput_map(df, out_path, title, ratio_col="relflux",
                         cbar_label="Relative flux (flux / max)",
-                        cmap="gray"):
+                        cmap="gray", vmin=None, vmax=None, dpi=150,
+                        frame_label=None):
     """Three-panel broken-axis sky map.
 
     Layout copied from plot_throughput_map() in extract_flux_throughput.py:
     same xlims, widths, panel ratios, break marks, ID/trace annotations,
     p2-p98 robust color limits. Visual twist: panel facecolor is BLACK and
     markers have WHITE edges with a grayscale-shaded fill keyed to relflux.
+
+    For folder/GIF mode, pass explicit vmin/vmax to keep the colorbar
+    consistent across frames; pass frame_label to caption the frame.
     """
     xlims = [(-19.5, -15), (-4, 4), (15, 19.5)]
     widths = [b - a for a, b in xlims]
     ymin = df["sky_y"].min() - 1
     ymax = df["sky_y"].max() + 1
 
-    vmin, vmax = np.nanpercentile(df[ratio_col], [2, 98])
+    auto_lo, auto_hi = np.nanpercentile(df[ratio_col], [2, 98])
+    if vmin is None:
+        vmin = auto_lo
+    if vmax is None:
+        vmax = auto_hi
 
     fig, axes = plt.subplots(
         1, 3, figsize=(15, 8), sharey=True,
@@ -501,14 +546,341 @@ def plot_throughput_map(df, out_path, title, ratio_col="relflux",
     cbar.set_label(cbar_label, fontsize=11)
 
     med = np.nanmedian(df[ratio_col])
-    fig.suptitle(
-        f"{title}   "
-        f"(N={len(df)}, median={med:.3f}, "
-        f"p2-98=[{vmin:.3f}, {vmax:.3f}])",
-        fontsize=13, y=0.96,
-    )
-    fig.savefig(out_path, bbox_inches="tight")
+    suptitle = (f"{title}   "
+                f"(N={len(df)}, median={med:.3f}, "
+                f"p2-98=[{vmin:.3f}, {vmax:.3f}])")
+    if frame_label:
+        suptitle = f"{frame_label}\n{suptitle}"
+    fig.suptitle(suptitle, fontsize=13, y=0.97)
+    fig.savefig(out_path, bbox_inches="tight", dpi=dpi)
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Folder mode: per-frame processing, repeatability, centroid-trail plot, GIF
+# ---------------------------------------------------------------------------
+
+def collect_image2_paths(image2_arg):
+    """If image2_arg is a directory, glob FITS files in it. Otherwise
+    return [image2_arg]."""
+    if os.path.isdir(image2_arg):
+        patterns = ("*.fits", "*.fit", "*.fts",
+                    "*.FITS", "*.FIT", "*.FTS",
+                    "*.fits.gz", "*.fit.gz")
+        paths = []
+        for pat in patterns:
+            paths.extend(glob.glob(os.path.join(image2_arg, pat)))
+        paths = sorted(set(paths))
+        if not paths:
+            raise FileNotFoundError(f"No FITS files in directory: {image2_arg}")
+        return paths
+    if not os.path.isfile(image2_arg):
+        raise FileNotFoundError(image2_arg)
+    return [image2_arg]
+
+
+def process_image2(data2, sources_template, aperture_scale, frame_name=""):
+    """Forced sep.sum_circle photometry on data2 using sources_template
+    positions and per-fiber FWHMs. Returns a copy of sources_template with
+    flux_image2, flux_image2_err, flag_image2, relflux columns added."""
+    flux2, fluxerr2, flag2, _, _ = forced_aperture_photometry(
+        data2, sources_template["x"].values, sources_template["y"].values,
+        sources_template["fwhm"].values, aperture_scale=aperture_scale,
+    )
+    out = sources_template.copy()
+    out["flux_image2"] = flux2
+    out["flux_image2_err"] = fluxerr2
+    out["flag_image2"] = flag2
+    out["frame"] = frame_name
+    fmax = float(np.nanmax(flux2))
+    if np.isfinite(fmax) and fmax > 0:
+        out["relflux"] = flux2 / fmax
+    else:
+        out["relflux"] = np.nan
+    return out, fmax
+
+
+def per_frame_metrics(df, frame_name):
+    """Compute the per-frame summary used for repeatability statistics."""
+    flux = df["flux_image2"].values.astype(float)
+    valid = np.isfinite(flux)
+    f = np.where(valid & (flux > 0), flux, 0.0)
+    total = float(np.sum(f))
+    if total <= 0:
+        return None
+
+    sx = df["sky_x"].values
+    sy = df["sky_y"].values
+    cx = float(np.sum(f * sx) / total)
+    cy = float(np.sum(f * sy) / total)
+
+    idx_max = int(np.nanargmax(flux))
+    best_id = int(df["ID"].iloc[idx_max])
+    f_max = float(flux[idx_max])
+
+    # Top-N concentration metrics (independent of WHICH fibers are
+    # brightest -- just measures how peaked the light distribution is).
+    sorted_f = np.sort(f)[::-1]
+    top1 = float(sorted_f[0] / total)
+    top5 = float(np.sum(sorted_f[:5]) / total)
+    top10 = float(np.sum(sorted_f[:10]) / total)
+
+    # Number of fibers carrying >=10% of the brightest fiber's flux --
+    # a rough proxy for "spot size on the IFU face".
+    n_above_10pct = int(np.sum(flux >= 0.1 * f_max))
+
+    return {
+        "frame":                  frame_name,
+        "centroid_sky_x":         cx,
+        "centroid_sky_y":         cy,
+        "brightest_fiber":        best_id,
+        "brightest_fiber_flux":   f_max,
+        "total_flux":             total,
+        "top1_fraction":          top1,
+        "top5_fraction":          top5,
+        "top10_fraction":         top10,
+        "n_fibers_above_10pct":   n_above_10pct,
+    }
+
+
+def aggregate_repeatability(per_frame_df):
+    """Reduce the per-frame summary table to a few headline numbers.
+
+    Headline metric: centroid_rms = root-mean-square distance of each
+    frame's flux-weighted centroid from the mean centroid. Lower is
+    better. In the same units as sky_x / sky_y.
+    """
+    n = len(per_frame_df)
+    if n == 0:
+        return {}
+
+    cx = per_frame_df["centroid_sky_x"].values
+    cy = per_frame_df["centroid_sky_y"].values
+    cx_m, cy_m = float(np.mean(cx)), float(np.mean(cy))
+    cx_s = float(np.std(cx, ddof=1)) if n > 1 else 0.0
+    cy_s = float(np.std(cy, ddof=1)) if n > 1 else 0.0
+    rms = float(np.sqrt(np.mean((cx - cx_m) ** 2 + (cy - cy_m) ** 2)))
+
+    fiber_counts = per_frame_df["brightest_fiber"].value_counts()
+    mode_id = int(fiber_counts.index[0])
+    mode_count = int(fiber_counts.iloc[0])
+
+    tf = per_frame_df["total_flux"].values.astype(float)
+    tf_rel_std = float(np.std(tf, ddof=1) / np.mean(tf)) if n > 1 and np.mean(tf) > 0 else 0.0
+
+    top5 = per_frame_df["top5_fraction"].values
+    top5_mean = float(np.mean(top5))
+    top5_std  = float(np.std(top5, ddof=1)) if n > 1 else 0.0
+
+    return {
+        "n_frames":                 n,
+        "centroid_x_mean":          cx_m,
+        "centroid_y_mean":          cy_m,
+        "centroid_x_std":           cx_s,
+        "centroid_y_std":           cy_s,
+        "centroid_rms":             rms,
+        "brightest_fiber_mode":     mode_id,
+        "brightest_fiber_consistency": float(mode_count) / n,
+        "brightest_fiber_unique":   int(fiber_counts.size),
+        "total_flux_relative_std":  tf_rel_std,
+        "top5_fraction_mean":       top5_mean,
+        "top5_fraction_std":        top5_std,
+    }
+
+
+def print_repeatability(agg, fiber_counts):
+    """Pretty-print the headline numbers."""
+    print("\n" + "=" * 70)
+    print(f"REPEATABILITY SUMMARY  ({agg['n_frames']} frames)")
+    print("=" * 70)
+    print(f"  Centroid (sky_x, sky_y):  "
+          f"({agg['centroid_x_mean']:+.4f}, {agg['centroid_y_mean']:+.4f})  "
+          f"± ({agg['centroid_x_std']:.4f}, {agg['centroid_y_std']:.4f})")
+    print(f"  Centroid RMS scatter:     {agg['centroid_rms']:.4f}  "
+          "(headline number; sky-coord units)")
+    print(f"  Brightest fiber:          ID {agg['brightest_fiber_mode']} "
+          f"in {int(round(agg['brightest_fiber_consistency'] * agg['n_frames']))}/"
+          f"{agg['n_frames']} frames "
+          f"(unique winners: {agg['brightest_fiber_unique']})")
+    print(f"  Total flux scatter:       "
+          f"{100 * agg['total_flux_relative_std']:.2f}% "
+          f"(seeing/throughput proxy)")
+    print(f"  Top-5 flux concentration: "
+          f"{100 * agg['top5_fraction_mean']:.1f}% ± "
+          f"{100 * agg['top5_fraction_std']:.1f}% "
+          "(spot size proxy)")
+    if agg['brightest_fiber_unique'] > 1:
+        print("\n  Brightest-fiber distribution:")
+        for fid, cnt in fiber_counts.head(5).items():
+            print(f"    ID {int(fid):>4d}:  {cnt:>3d} / {agg['n_frames']} frames")
+    print("=" * 70 + "\n")
+
+
+def plot_centroid_trail(per_frame_df, sources_template, agg, out_path):
+    """Two panels: full-IFU broken-axis layout + zoomed centroid scatter.
+
+    Left/middle/right (broken axes): all 244 fibers as faint gray dots so
+    the centroid trail can be located on the IFU. The flux-weighted
+    centroid for each frame is overplotted as a colored dot, with frame
+    index as the color.
+    Bottom panel: a zoom on the centroid cloud with mean point and 1-sigma
+    error ellipse. This is the actual repeatability picture.
+    """
+    fig = plt.figure(figsize=(15, 11))
+    # --- Top: full IFU broken-axis with centroid trail
+    xlims = [(-19.5, -15), (-4, 4), (15, 19.5)]
+    widths = [b - a for a, b in xlims]
+    ymin = sources_template["sky_y"].min() - 1
+    ymax = sources_template["sky_y"].max() + 1
+
+    gs = fig.add_gridspec(2, 3, height_ratios=[2, 1.4],
+                          width_ratios=widths, hspace=0.25, wspace=0.05)
+    axes_top = [fig.add_subplot(gs[0, i]) for i in range(3)]
+
+    cx_all = per_frame_df["centroid_sky_x"].values
+    cy_all = per_frame_df["centroid_sky_y"].values
+    cmap = plt.get_cmap("viridis")
+    n = len(per_frame_df)
+    colors = cmap(np.linspace(0, 1, max(n, 2)))
+
+    sc_top = None
+    for i, ax in enumerate(axes_top):
+        a, b = xlims[i]
+        sub = sources_template[(sources_template["sky_x"] >= a) &
+                               (sources_template["sky_x"] <= b)]
+        ax.set_facecolor("black")
+        ax.scatter(sub["sky_x"], sub["sky_y"], s=20,
+                   c="0.35", edgecolors="0.6", linewidths=0.3, zorder=1)
+        m = (cx_all >= a) & (cx_all <= b)
+        if np.any(m):
+            sc_top = ax.scatter(cx_all[m], cy_all[m],
+                                c=np.arange(n)[m], cmap="viridis",
+                                s=70, edgecolors="white", linewidths=0.7,
+                                zorder=4)
+        # Mean centroid
+        ax.scatter([agg["centroid_x_mean"]], [agg["centroid_y_mean"]],
+                   marker="*", s=320, c="red", edgecolors="white",
+                   linewidths=0.7, zorder=5)
+        ax.set_xlim(a, b)
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.25, ls="--", lw=0.5, color="gray")
+        ax.tick_params(axis="both", labelsize=9)
+        if i > 0:
+            ax.spines["left"].set_visible(False)
+            ax.tick_params(axis="y", which="both", left=False)
+        if i < 2:
+            ax.spines["right"].set_visible(False)
+
+    axes_top[0].set_ylabel("Sky Y", fontsize=11)
+    axes_top[1].set_xlabel("Sky X", fontsize=11)
+
+    # Break marks
+    d = 0.012
+    kw = dict(color="k", clip_on=False, lw=1.0)
+    for i in (0, 1):
+        ax = axes_top[i]
+        tk = dict(kw, transform=ax.transAxes)
+        ax.plot([1 - d, 1 + d], [-d, +d], **tk)
+        ax.plot([1 - d, 1 + d], [1 - d, 1 + d], **tk)
+    for i in (1, 2):
+        ax = axes_top[i]
+        tk = dict(kw, transform=ax.transAxes)
+        ax.plot([-d, +d], [-d, +d], **tk)
+        ax.plot([-d, +d], [1 - d, 1 + d], **tk)
+
+    if sc_top is not None:
+        cb = fig.colorbar(sc_top, ax=axes_top, fraction=0.025, pad=0.02,
+                          shrink=0.85)
+        cb.set_label("Frame index", fontsize=10)
+
+    # --- Bottom: zoomed centroid scatter
+    ax_zoom = fig.add_subplot(gs[1, :])
+    ax_zoom.set_facecolor("black")
+    # Plot fibers near the cloud as context
+    pad = 4 * max(agg["centroid_x_std"], agg["centroid_y_std"], 0.1)
+    xz_lo = agg["centroid_x_mean"] - pad
+    xz_hi = agg["centroid_x_mean"] + pad
+    yz_lo = agg["centroid_y_mean"] - pad
+    yz_hi = agg["centroid_y_mean"] + pad
+    near = sources_template[
+        (sources_template["sky_x"] >= xz_lo) & (sources_template["sky_x"] <= xz_hi) &
+        (sources_template["sky_y"] >= yz_lo) & (sources_template["sky_y"] <= yz_hi)
+    ]
+    ax_zoom.scatter(near["sky_x"], near["sky_y"], s=120,
+                    c="0.18", edgecolors="0.55", linewidths=0.4, zorder=1)
+    for _, row in near.iterrows():
+        ax_zoom.annotate(str(int(row["ID"])),
+                         xy=(row["sky_x"], row["sky_y"]),
+                         xytext=(0, 0), textcoords="offset points",
+                         fontsize=7, ha="center", va="center",
+                         color="0.7", zorder=2)
+
+    # Centroid trail with frame indices
+    sc = ax_zoom.scatter(cx_all, cy_all, c=np.arange(n), cmap="viridis",
+                         s=80, edgecolors="white", linewidths=0.8, zorder=4)
+    for i, (x, y) in enumerate(zip(cx_all, cy_all)):
+        ax_zoom.annotate(f"{i}", xy=(x, y), xytext=(4, 4),
+                         textcoords="offset points",
+                         fontsize=7, color="white", zorder=5)
+
+    # Mean + 1-sigma ellipse
+    ax_zoom.scatter([agg["centroid_x_mean"]], [agg["centroid_y_mean"]],
+                    marker="*", s=420, c="red", edgecolors="white",
+                    linewidths=0.8, zorder=6,
+                    label=f"mean ({agg['centroid_x_mean']:+.3f}, "
+                          f"{agg['centroid_y_mean']:+.3f})")
+    if agg["n_frames"] > 1:
+        ell = Ellipse(
+            (agg["centroid_x_mean"], agg["centroid_y_mean"]),
+            2 * agg["centroid_x_std"], 2 * agg["centroid_y_std"],
+            fill=False, edgecolor="red", lw=1.0, ls="--", zorder=5,
+            label=f"1σ ellipse (RMS={agg['centroid_rms']:.3f})",
+        )
+        ax_zoom.add_patch(ell)
+
+    ax_zoom.set_xlim(xz_lo, xz_hi)
+    ax_zoom.set_ylim(yz_lo, yz_hi)
+    ax_zoom.set_aspect("equal")
+    ax_zoom.set_xlabel("Sky X")
+    ax_zoom.set_ylabel("Sky Y")
+    ax_zoom.grid(True, alpha=0.25, ls="--", lw=0.5, color="gray")
+    ax_zoom.legend(fontsize=9, loc="upper right",
+                   facecolor="white", framealpha=0.85)
+
+    fig.suptitle(
+        f"Star centroid repeatability — N={agg['n_frames']} frames    "
+        f"RMS={agg['centroid_rms']:.4f}    "
+        f"brightest fiber {agg['brightest_fiber_mode']} in "
+        f"{int(round(agg['brightest_fiber_consistency'] * agg['n_frames']))}/"
+        f"{agg['n_frames']} frames",
+        fontsize=13, y=0.995,
+    )
+    fig.savefig(out_path, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+
+
+def make_gif(image_paths, out_path, duration_ms=500):
+    """Stitch a list of PNGs into an animated GIF. Uses PIL."""
+    if not image_paths:
+        return False
+    if not HAVE_PIL:
+        print("  WARNING: Pillow not installed; skipping GIF. "
+              "`pip install Pillow` to enable.")
+        return False
+    frames = []
+    for p in image_paths:
+        try:
+            frames.append(PILImage.open(p).convert("RGB"))
+        except Exception as e:
+            print(f"  WARNING: skipping {p} in GIF: {e}")
+    if not frames:
+        return False
+    frames[0].save(
+        out_path, save_all=True, append_images=frames[1:],
+        duration=duration_ms, loop=0, optimize=False,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +894,11 @@ def main():
     )
     parser.add_argument("image1", help="IFU imaging-mode flat (FITS)")
     parser.add_argument("image2",
-                        help="Second image for forced photometry (FITS)")
+                        help="FITS file OR a directory of FITS files for "
+                             "forced photometry. If a directory, all FITS "
+                             "files inside are processed against the same "
+                             "fiber template from image1 and assembled "
+                             "into a GIF + repeatability summary.")
     parser.add_argument("--csv", default="final_data.csv",
                         help="fiber metadata table (default: final_data.csv)")
     parser.add_argument("--aperture-scale", type=float, default=1.0,
@@ -595,6 +971,20 @@ def main():
                         help="matplotlib colormap for the throughput map "
                              "(default 'gray'; try 'inferno' or 'magma' for "
                              "more visible low-flux fibers)")
+    parser.add_argument("--gif-duration", type=int, default=500,
+                        help="(folder mode) milliseconds per GIF frame "
+                             "(default 500)")
+    parser.add_argument("--no-gif", action="store_true",
+                        help="(folder mode) skip GIF assembly even if "
+                             "Pillow is available")
+    parser.add_argument("--fixed-color-limits", action="store_true",
+                        help="(folder mode) force vmin=0, vmax=1 for the "
+                             "throughput map color scale. Default behavior "
+                             "in folder mode is pooled p2-p98 across all "
+                             "frames (so the colorbar is the same on every "
+                             "plot but doesn't waste range on outliers). "
+                             "Use this flag instead if you want strict "
+                             "[0, 1] across runs.")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -602,24 +992,24 @@ def main():
     def out(name):
         return os.path.join(args.outdir, f"{stem}_{name}")
 
-    # ---- Load images
+    # ---- Resolve image2 path(s)
+    image2_paths = collect_image2_paths(args.image2)
+    folder_mode = len(image2_paths) > 1
+    print(f"[setup] image1={args.image1}, "
+          f"{'folder' if folder_mode else 'single'} mode "
+          f"({len(image2_paths)} image2 file{'s' if folder_mode else ''})")
+
+    # ---- Load image1
     print(f"[load] {args.image1}")
     data1 = load_fits(args.image1)
-    print(f"[load] {args.image2}")
-    data2 = load_fits(args.image2)
     print(f"  shape image1 = {data1.shape}")
-    print(f"  shape image2 = {data2.shape}")
-    if data1.shape != data2.shape:
-        print("  WARNING: image shapes differ; forced photometry assumes a "
-              "shared pixel coordinate system.")
 
     # ---- Step 1: locate the dot column
     x_peak, y_collapsed = find_dot_column(data1)
     print(f"[step 1] dot column at x = {x_peak}")
     plot_xprofile(y_collapsed, x_peak, out("xprofile.pdf"))
 
-    # ---- Step 2: column profile (same band/mode as detection so the
-    # yprofile diagnostic matches what the peak finder actually saw)
+    # ---- Step 2: column profile
     yprof = column_profile(data1, x_peak,
                            half_band=args.column_band,
                            mode=args.profile_mode)
@@ -685,7 +1075,7 @@ def main():
     print(f"[step 6] cross-matching to {args.csv}")
     sources, _ = match_to_fibers(sources, args.csv)
 
-    # ---- Self-photometry on Image 1 (for sanity)
+    # ---- Self-photometry on Image 1 (sanity)
     flux1, fluxerr1, flag1, radii, _ = forced_aperture_photometry(
         data1, sources["x"].values, sources["y"].values,
         sources["fwhm"].values, aperture_scale=args.aperture_scale,
@@ -696,44 +1086,138 @@ def main():
 
     plot_image1_detection(data1, sources, radii, out("image1_detection.pdf"))
 
-    # ---- Step 7: forced photometry on Image 2
-    print(f"[step 7] forced photometry on Image 2 with "
-          f"r_i = {args.aperture_scale:.2f} * FWHM_i / 2")
-    flux2, fluxerr2, flag2, _, _ = forced_aperture_photometry(
-        data2, sources["x"].values, sources["y"].values,
-        sources["fwhm"].values, aperture_scale=args.aperture_scale,
-    )
-    sources["flux_image2"] = flux2
-    sources["flux_image2_err"] = fluxerr2
-    sources["flag_image2"] = flag2
+    # Save the fiber template -- positions, FWHMs, IDs. Same for every
+    # image2 frame in folder mode.
+    template_csv = out("fiber_template.csv")
+    sources.to_csv(template_csv, index=False)
+    print(f"[write] {template_csv}")
 
-    # ---- Step 8: relative flux
-    fmax = float(np.nanmax(flux2))
-    if not np.isfinite(fmax) or fmax <= 0:
-        print("  WARNING: max(flux2) is not positive — relflux undefined.")
-        sources["relflux"] = np.nan
+    # ---- Step 7-9: forced photometry on each image2 frame
+    if folder_mode:
+        per_frame_dir = os.path.join(args.outdir, "per_frame")
+        os.makedirs(per_frame_dir, exist_ok=True)
+
+    per_frame_summary = []
+    png_paths = []   # for the GIF
+
+    cbar_label = (f"Relative flux  (flux / max,  "
+                  f"D = {args.aperture_scale:.2f} × FWHM)")
+
+    # ---- Pass 1: photometry + per-frame CSVs + repeatability metrics.
+    # Keep DataFrames in memory so pass 2 can render with shared color
+    # limits. ~244 rows per frame is trivial for any reasonable run.
+    frame_records = []  # list of (fi, frame_name, df, csv_path, pdf_path, png_path)
+
+    for fi, p2 in enumerate(image2_paths):
+        frame_name = os.path.splitext(os.path.basename(p2))[0]
+        print(f"\n[frame {fi + 1}/{len(image2_paths)}] {p2}")
+        data2 = load_fits(p2)
+        if data2.shape != data1.shape:
+            print(f"  WARNING: {frame_name} shape {data2.shape} differs "
+                  f"from image1 {data1.shape}; forced photometry assumes "
+                  "shared pixel coordinates.")
+
+        df, fmax = process_image2(data2, sources, args.aperture_scale,
+                                  frame_name=frame_name)
+        print(f"  max flux = {fmax:.3e}, "
+              f"median relflux = {np.nanmedian(df['relflux']):.3f}")
+
+        if folder_mode:
+            csv_p = os.path.join(per_frame_dir, f"{frame_name}_fluxes.csv")
+            pdf_p = os.path.join(per_frame_dir, f"{frame_name}_throughput_map.pdf")
+            png_p = os.path.join(per_frame_dir, f"{frame_name}_throughput_map.png")
+        else:
+            csv_p = out("fiber_positions.csv")
+            pdf_p = out("throughput_map.pdf")
+            png_p = None
+
+        df.to_csv(csv_p, index=False)
+        frame_records.append((fi, frame_name, df, csv_p, pdf_p, png_p))
+
+        m = per_frame_metrics(df, frame_name)
+        if m is not None:
+            per_frame_summary.append(m)
+
+    # ---- Determine the shared color scale across ALL frames so the
+    # GIF (and per-frame PDFs) use a consistent colorbar.
+    if args.fixed_color_limits:
+        map_vmin, map_vmax = 0.0, 1.0
+        scale_descr = "fixed [0, 1]"
     else:
-        sources["relflux"] = flux2 / fmax
-    print(f"  max image2 flux = {fmax:.3e}; "
-          f"median relflux = {np.nanmedian(sources['relflux']):.3f}")
+        all_relflux = np.concatenate([r[2]["relflux"].values
+                                      for r in frame_records])
+        all_relflux = all_relflux[np.isfinite(all_relflux)]
+        if all_relflux.size:
+            map_vmin = float(np.nanpercentile(all_relflux, 2))
+            map_vmax = float(np.nanpercentile(all_relflux, 98))
+            # Guarantee a visible range even when relflux is uniform
+            if map_vmax - map_vmin < 1e-3:
+                map_vmin = float(np.nanmin(all_relflux))
+                map_vmax = float(np.nanmax(all_relflux))
+        else:
+            map_vmin, map_vmax = 0.0, 1.0
+        scale_descr = (f"pooled p2-p98 across {len(frame_records)} frames"
+                       if folder_mode else "p2-p98")
+    if folder_mode:
+        print(f"\n[scale] shared colormap range: "
+              f"vmin={map_vmin:.4f}, vmax={map_vmax:.4f} ({scale_descr})")
 
-    # ---- Save table
-    csv_out = out("fiber_positions.csv")
-    sources.to_csv(csv_out, index=False)
-    print(f"[write] {csv_out}")
+    # ---- Pass 2: render PDFs and PNGs with the shared scale
+    for fi, frame_name, df, csv_p, pdf_p, png_p in frame_records:
+        plot_throughput_map(
+            df, pdf_p,
+            title=f"IFU forced-photometry throughput",
+            ratio_col="relflux", cbar_label=cbar_label,
+            cmap=args.cmap, vmin=map_vmin, vmax=map_vmax,
+            frame_label=(f"frame {fi + 1}/{len(image2_paths)}: {frame_name}"
+                         if folder_mode else frame_name),
+        )
+        if png_p:
+            plot_throughput_map(
+                df, png_p,
+                title=f"IFU forced-photometry throughput",
+                ratio_col="relflux", cbar_label=cbar_label,
+                cmap=args.cmap, vmin=map_vmin, vmax=map_vmax,
+                dpi=120,
+                frame_label=f"frame {fi + 1}/{len(image2_paths)}: {frame_name}",
+            )
+            png_paths.append(png_p)
 
-    # ---- Step 9: 3-panel broken-axis sky map
-    pdf_out = out("throughput_map.pdf")
-    plot_throughput_map(
-        sources, pdf_out,
-        title=f"IFU forced-photometry throughput  ({stem})",
-        ratio_col="relflux",
-        cbar_label=(f"Relative flux  (flux / max,  "
-                    f"D = {args.aperture_scale:.2f} × FWHM)"),
-        cmap=args.cmap,
-    )
-    print(f"[write] {pdf_out}")
-    print("[done]")
+    # ---- Folder-mode aggregates
+    if folder_mode and per_frame_summary:
+        sum_df = pd.DataFrame(per_frame_summary)
+        sum_csv = out("repeatability_summary.csv")
+        sum_df.to_csv(sum_csv, index=False)
+        print(f"\n[write] {sum_csv}")
+
+        agg = aggregate_repeatability(sum_df)
+        fiber_counts = sum_df["brightest_fiber"].value_counts()
+        print_repeatability(agg, fiber_counts)
+
+        agg_txt = out("repeatability_aggregate.txt")
+        with open(agg_txt, "w") as f:
+            f.write(f"# Repeatability aggregate from {agg['n_frames']} frames\n")
+            f.write(f"# Source: {args.image2}\n\n")
+            for k, v in agg.items():
+                f.write(f"{k}: {v}\n")
+            f.write("\n# Brightest-fiber distribution:\n")
+            for fid, cnt in fiber_counts.items():
+                f.write(f"#   ID {int(fid):>4d}: {cnt} / {agg['n_frames']} frames\n")
+        print(f"[write] {agg_txt}")
+
+        trail_pdf = out("centroid_trail.pdf")
+        plot_centroid_trail(sum_df, sources, agg, trail_pdf)
+        print(f"[write] {trail_pdf}")
+
+        if not args.no_gif:
+            gif_path = out("throughput_animation.gif")
+            ok = make_gif(png_paths, gif_path,
+                          duration_ms=args.gif_duration)
+            if ok:
+                print(f"[write] {gif_path}  "
+                      f"({len(png_paths)} frames @ {args.gif_duration} ms)")
+
+    print("\n[done]")
 
 
 if __name__ == "__main__":
