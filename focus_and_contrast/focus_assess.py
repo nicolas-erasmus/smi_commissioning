@@ -502,6 +502,79 @@ def topographic_plot(name, diag_list, ny, nx, score, out_path,
     plt.close(fig)
 
 
+def contrast_vs_wavelength_plot(wave_rows, focus_key, wave_start, wave_end,
+                                nx, out_path):
+    """
+    Plot per-column contrast vs wavelength for every file with a focus
+    header value, on a single axes.  One shaded band per focus position,
+    color-coded by focus offset from the minimum focus value in the sweep.
+    Band centre = median contrast at that column;
+    band half-width = std of contrast values at that column.
+
+    Parameters
+    ----------
+    wave_rows : list of (name, focus_val, eval_xs, per_col_median, per_col_std)
+    wave_start, wave_end : float
+        Wavelengths corresponding to detector x = 0 and x = nx - 1.
+    nx : int
+        Detector width in pixels (linear pixel -> wavelength calibration).
+    """
+    pts = [(n, fv, xs, cs, sds) for (n, fv, xs, cs, sds) in wave_rows
+           if fv is not None and len(xs) > 0]
+    if len(pts) < 1:
+        return False
+
+    pts.sort(key=lambda t: t[1])
+    focus_vals = np.array([p[1] for p in pts], dtype=float)
+    fmin = float(np.min(focus_vals))
+    fmax = float(np.max(focus_vals))
+    offsets = focus_vals - fmin
+    omax = float(np.max(offsets)) if np.max(offsets) > 0 else 1.0
+    cmap = plt.get_cmap("viridis")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for (name, fv, xs, cs, sds) in pts:
+        xs = np.asarray(xs, dtype=float)
+        cs = np.asarray(cs, dtype=float)
+        sds = np.asarray(sds, dtype=float)
+        offset = fv - fmin
+        color = cmap(offset / omax) if omax > 0 else cmap(0.5)
+        # Linear pixel -> wavelength calibration
+        waves = wave_start + (wave_end - wave_start) * (xs / max(nx - 1, 1))
+        order = np.argsort(waves)
+        waves = waves[order]
+        cs = cs[order]
+        sds = sds[order]
+        label = f"Δ{focus_key}={offset:g}"
+        ax.fill_between(waves, cs - sds, cs + sds,
+                        color=color, alpha=0.25, linewidth=0)
+        ax.plot(waves, cs, "-", lw=1.4, color=color, label=label)
+
+    ax.set_xlabel("Wavelength "
+                  f"(linear: x=0 -> {wave_start:g}, x={nx-1} -> {wave_end:g})")
+    ax.set_ylabel("Contrast = 1 - Michelson  (lower = sharper)")
+    ax.set_title(f"Contrast vs wavelength across {focus_key} sweep "
+                 f"(offset from min={fmin:g})")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(alpha=0.3)
+
+    # Use a colorbar instead of a legend if there are many lines
+    if len(pts) > 8 and omax > 0:
+        from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
+        sm = ScalarMappable(norm=Normalize(vmin=0.0, vmax=omax), cmap=cmap)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, shrink=0.85)
+        cbar.set_label(f"Δ{focus_key} (offset from {fmin:g})")
+    else:
+        ax.legend(loc="best", fontsize=8, ncol=2)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return True
+
+
 def summary_focus_plot(rows, focus_key, out_path):
     pts = [(n, s, sc, fv) for (n, s, sc, fv) in rows
            if fv is not None and np.isfinite(s)]
@@ -574,6 +647,13 @@ def main():
     p.add_argument("--focus-key", default="FOCUS",
                    help="FITS header keyword for focus value "
                         "(default FOCUS).  Empty = skip header read.")
+    p.add_argument("--wave-start", type=float, default=None,
+                   help="Wavelength at detector x = 0 (for the contrast-"
+                        "vs-wavelength plot).  Required together with "
+                        "--wave-end; otherwise the plot is skipped.")
+    p.add_argument("--wave-end", type=float, default=None,
+                   help="Wavelength at detector x = nx - 1 (for the "
+                        "contrast-vs-wavelength plot).")
     p.add_argument("--pattern", default="*.fits",
                    help="Glob pattern (default *.fits)")
     p.add_argument("--output-dir", default=None,
@@ -616,6 +696,7 @@ def main():
     print(f"\nMeasuring focus on {len(files)} files "
           f"({args.eval_cols} columns each)...")
     rows = []
+    wave_rows = []   # (name, focus_val, eval_xs, per_col_contrast)
     for f in files:
         name = os.path.basename(f)
         try:
@@ -639,6 +720,21 @@ def main():
         print(f"  {name:40s}  C = {r['score']:.4f}  "
               f"+/- {r['scatter']:.4f}   {args.focus_key} = {fv_str}")
         rows.append((name, r["score"], r["scatter"], focus_val))
+
+        # Per-column median and std of contrast for the contrast-vs-
+        # wavelength band plot
+        col_xs, col_cs, col_sds = [], [], []
+        for d in r["diagnostics"]:
+            c = d["contrast"]
+            finite_c = c[np.isfinite(c)] if len(c) else c
+            if finite_c.size:
+                col_xs.append(d["x"])
+                col_cs.append(float(np.median(finite_c)))
+                col_sds.append(float(np.std(finite_c)))
+        wave_rows.append((name, focus_val,
+                          np.asarray(col_xs, dtype=float),
+                          np.asarray(col_cs, dtype=float),
+                          np.asarray(col_sds, dtype=float)))
 
         if not args.no_per_file_plots:
             stem = os.path.splitext(name)[0]
@@ -678,6 +774,21 @@ def main():
     else:
         print(f"  (skipped contrast-vs-{args.focus_key} plot: "
               f"no/insufficient header values)")
+
+    # Contrast vs wavelength (one line per focus position)
+    if args.wave_start is not None and args.wave_end is not None:
+        wave_path = os.path.join(out_dir, "contrast_vs_wavelength.png")
+        if contrast_vs_wavelength_plot(
+            wave_rows, args.focus_key,
+            args.wave_start, args.wave_end, nx, wave_path,
+        ):
+            print(f"Wrote {wave_path}")
+        else:
+            print(f"  (skipped contrast-vs-wavelength plot: "
+                  f"no header focus values)")
+    elif args.wave_start is not None or args.wave_end is not None:
+        print("  (skipped contrast-vs-wavelength plot: need both "
+              "--wave-start and --wave-end)")
 
     if not args.no_per_file_plots:
         print(f"Per-file plots in {out_dir}/profile_*.png and topo_*.png")
