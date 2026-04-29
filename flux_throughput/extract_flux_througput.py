@@ -346,6 +346,68 @@ def plot_throughput_map(df, folder_name, ratio_col='ratio',
     return fig
 
 
+def _bin_along_last_axis(arr, bin_size):
+    """Median-bin non-overlapping groups of bin_size pixels along the last axis.
+
+    NaN-aware. Trailing pixels that don't fill a complete bin are dropped
+    (rather than padded) so the bin width is exactly bin_size everywhere.
+    """
+    if bin_size is None or bin_size <= 1:
+        return arr
+    n = arr.shape[-1]
+    n_full = (n // bin_size) * bin_size
+    arr = arr[..., :n_full]
+    new_shape = arr.shape[:-1] + (n_full // bin_size, bin_size)
+    import warnings
+    with warnings.catch_warnings():
+        # All-NaN bins return NaN — that's the desired behavior, not a bug.
+        warnings.filterwarnings("ignore", r"All-NaN slice encountered",
+                                RuntimeWarning)
+        return np.nanmedian(arr.reshape(new_shape), axis=-1)
+
+
+def plot_throughput_vs_wavelength(spec_2d, wave, xlabel, folder_name,
+                                  title, ylabel, suffix,
+                                  bin_size=1):
+    """Min / max / median throughput across traces vs wavelength.
+
+    spec_2d  : (n_traces, nx) per-pixel ratio spectrum
+    wave     : (nx,) wavelength (or x-pixel) axis
+    bin_size : average every N pixels along the wavelength axis before
+               computing min/max/median. 1 = no binning. Useful for
+               suppressing per-pixel noise in the min/max envelope.
+    """
+    arr = _bin_along_last_axis(spec_2d, bin_size)
+    w = _bin_along_last_axis(wave, bin_size)
+
+    med = np.nanmedian(arr, axis=0)
+    lo  = np.nanmin(arr, axis=0)
+    hi  = np.nanmax(arr, axis=0)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.fill_between(w, lo, hi, alpha=0.18, color='steelblue',
+                    label='min–max envelope')
+    ax.plot(w, hi, color='black', lw=0.6, ls='--', alpha=0.6, label='max')
+    ax.plot(w, lo, color='gray',  lw=0.6, ls='--', alpha=0.6, label='min')
+    ax.plot(w, med, color='navy', lw=1.4, label='median')
+
+    bin_str = f", binned x{bin_size}" if bin_size and bin_size > 1 else ""
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_title(f"{title}: {folder_name}   "
+                 f"(N={arr.shape[0]} traces{bin_str}, "
+                 f"overall median={np.nanmedian(med):.3f})",
+                 fontsize=12)
+    ax.grid(True, alpha=0.3, ls='--', lw=0.5)
+    ax.legend(loc='best', fontsize=9, framealpha=0.9)
+    ax.margins(x=0)
+
+    out = f"{folder_name}_{suffix}.pdf"
+    fig.savefig(out, bbox_inches='tight')
+    print(f"Saved: {out}")
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -359,6 +421,19 @@ def main():
                         help="Subtract a median sky-band background per column")
     parser.add_argument("--no-show", action="store_true",
                         help="Don't pop up the matplotlib window")
+    parser.add_argument("--wave-start", type=float, default=None,
+                        help="Wavelength at x=0 for rough linear calibration "
+                             "(e.g. Angstroms). If both --wave-start and --wave-end "
+                             "are given, the throughput-vs-wavelength plot uses them; "
+                             "otherwise the x axis is x pixel.")
+    parser.add_argument("--wave-end", type=float, default=None,
+                        help="Wavelength at x=nx-1 for rough linear calibration")
+    parser.add_argument("--wave-unit", default="Angstrom",
+                        help="Label for the wavelength axis (default: Angstrom)")
+    parser.add_argument("--bin", dest="bin_size", type=int, default=20,
+                        help="Median-bin every N pixels along the wavelength axis "
+                             "in the throughput-vs-wavelength plot (default: 20). "
+                             "Use --bin 1 to disable binning.")
     args = parser.parse_args()
 
     path_parts = args.image1.split(os.sep)
@@ -415,11 +490,15 @@ def main():
     # 4. Extract and ratio
     fiber_df_sorted = fiber_df.sort_values('slit_x').reset_index(drop=True)
     records = []
+    ifu_spec_list = []   # per-trace 1D spectra (length nx) — for wavelength plot
+    slit_spec_list = []
     for i, tr in enumerate(trace_info):
         if i >= len(fiber_df_sorted):
             break
         s1 = extract_flux(data1, tr['coeffs'], tr['fwhm'], bg_subtract=args.bg_subtract)
         s2 = extract_flux(data2, tr['coeffs'], tr['fwhm'], bg_subtract=args.bg_subtract)
+        ifu_spec_list.append(s1)
+        slit_spec_list.append(s2)
         records.append({
             'sky_x':     fiber_df_sorted.iloc[i]['sky_x'],
             'sky_y':     fiber_df_sorted.iloc[i]['sky_y'],
@@ -429,6 +508,8 @@ def main():
             'slit_flux': float(np.sum(s2)),
         })
     df = pd.DataFrame(records)
+    ifu_spec = np.array(ifu_spec_list)    # shape (n_kept_traces, nx)
+    slit_spec = np.array(slit_spec_list)
 
     # Per-fiber ratio (IFU / Slit at the same aperture)
     df['ratio'] = np.where(df['slit_flux'] > 0,
@@ -480,6 +561,56 @@ def main():
     pdf2 = f"{folder_name}_flux_throughput_map_centralnorm.pdf"
     fig2.savefig(pdf2, bbox_inches='tight')
     print(f"Saved: {pdf2}")
+
+    # 6. Throughput vs wavelength (min / max / median across traces)
+    # Per-pixel simple ratio: IFU / Slit, per fiber, per pixel.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio_spec = np.where(slit_spec > 0, ifu_spec / slit_spec, np.nan)
+
+    # Per-pixel central-normalised, area-corrected ratio. We rebuild the
+    # central reference from the *spectra* (not the scalar ref_slit) so the
+    # wavelength dependence of the slit lamp itself doesn't get baked in.
+    n_kept = ifu_spec.shape[0]
+    half = 5
+    mid = n_kept // 2
+    lo_c, hi_c = max(0, mid - half), min(n_kept, mid + half)
+    central_slit_spec = np.nanmean(slit_spec[lo_c:hi_c], axis=0)  # (nx,)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ratio_central_spec = np.where(
+            central_slit_spec > 0,
+            ifu_spec / central_slit_spec,
+            np.nan,
+        )
+    ratio_central_corr_spec = ratio_central_spec / SLIT_FIBER_AREA_RATIO
+
+    # Wavelength axis from rough linear calibration on the x-pixel range.
+    nx_pix = ifu_spec.shape[1]
+    if args.wave_start is not None and args.wave_end is not None:
+        wave = np.linspace(args.wave_start, args.wave_end, nx_pix)
+        xlabel = f"Wavelength ({args.wave_unit})"
+        print(f"Wavelength axis: {args.wave_start} -> {args.wave_end} "
+              f"{args.wave_unit} across {nx_pix} pixels "
+              f"({(args.wave_end - args.wave_start) / (nx_pix - 1):.4f} "
+              f"{args.wave_unit}/pix)")
+    else:
+        wave = np.arange(nx_pix)
+        xlabel = "X pixel"
+        print("No --wave-start/--wave-end given; plotting vs x pixel.")
+
+    plot_throughput_vs_wavelength(
+        ratio_spec, wave, xlabel, folder_name,
+        title='Flux Ratio vs Wavelength (IFU / Slit, per fiber)',
+        ylabel='IFU / Slit',
+        suffix='throughput_vs_wavelength_simple',
+        bin_size=args.bin_size,
+    )
+    plot_throughput_vs_wavelength(
+        ratio_central_corr_spec, wave, xlabel, folder_name,
+        title='Throughput vs Wavelength (central-norm, area-corrected)',
+        ylabel=f'(IFU / mean slit central {hi_c - lo_c}) / {SLIT_FIBER_AREA_RATIO}',
+        suffix='throughput_vs_wavelength_centralnorm',
+        bin_size=args.bin_size,
+    )
 
     if not args.no_show:
         plt.show()
